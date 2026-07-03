@@ -1,0 +1,14 @@
+SELECT current_database();
+DROP TABLE IF EXISTS qa_sessions CASCADE;
+DROP TABLE IF EXISTS interview_sessions CASCADE;
+DROP TABLE IF EXISTS interview_questions CASCADE;
+DROP TABLE IF EXISTS resume_reviews CASCADE;
+DROP TABLE IF EXISTS exam_reviews CASCADE;
+DROP TABLE IF EXISTS exam_submissions CASCADE;
+DROP TABLE IF EXISTS scoring_points CASCADE;
+DROP TABLE IF EXISTS questions CASCADE;
+DROP TABLE IF EXISTS exams CASCADE;
+DROP TABLE IF EXISTS knowledge_pending_queue CASCADE;
+DROP TABLE IF EXISTS users CASCADE;
+-- 以及删除对应的触发器和函数（可选）
+DROP FUNCTION IF EXISTS update_updated_at_column CASCADE;

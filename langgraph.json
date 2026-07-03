@@ -1,0 +1,6 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "chat_agent": "./langsmith_test.py:graph"
+  }
+}
