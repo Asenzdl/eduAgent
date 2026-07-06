@@ -1,6 +1,5 @@
-def main():
-    print("Hello from eduagent!")
+from fastapi import FastAPI
+from backend.api.v1.auth import router
 
-
-if __name__ == "__main__":
-    main()
+app = FastAPI()
+app.include_router(router)

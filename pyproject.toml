@@ -36,6 +36,7 @@ dependencies = [
     "setuptools>=81.0.0",
     "sqlalchemy[asyncio]>=2.0.51",
     "sse-starlette>=2.1.0,<3.4.0",
+    "tenacity>=9.0",
     "torch>=2.12.1",
     "torchvision>=0.27.1",
     "transformers>=5.12.1",
