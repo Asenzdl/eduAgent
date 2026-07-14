@@ -3,7 +3,7 @@ from pymilvus.exceptions import MilvusException
 
 from backend.config import get_settings
 from backend.core.logger import get_logger
-from backend.core.schemas import ChunkMetadata, DocumentChunk
+from backend.core.schemas import DocumentChunk
 
 logger = get_logger(__name__)
 
@@ -135,7 +135,7 @@ class MilvusRepository:
                          collection=self._collection_name, error=str(e))
             raise
 
-    async def _hybrid_search(
+    async def hybrid_search(
         self,
         dense_vector: list[float],
         sparse_vector: dict,
@@ -149,16 +149,18 @@ class MilvusRepository:
         两个 AnnSearchRequest 分别构造 Dense 和 Sparse 检索请求，
         由 Milvus 在服务端并行执行后，用 WeightedRanker 加权融合排序。
 
+        返回原始 entity（含 content 和所有标量字段），格式转换由 retriever.py 完成。
+
         Args:
-            query_embedding: Dense Query 向量（1024 维，来自 encode_query）
-            query_sparse:    Sparse Query 向量（{token_id: weight}，来自 encode_query）
-            top_k:           每路召回数量（融合后同样取 top_k）
-            filters:         Milvus bool 表达式，如 'tenant_id == "xxx"'
+            dense_vector:  Dense Query 向量（1024 维，来自 BGEMEmbedder.encode_query）
+            sparse_vector: Sparse Query 向量（{token_id: weight}）
+            top_k:         每路召回数量（融合后同样取 top_k）
+            expr:          Milvus 过滤表达式，如 'tenant_id == {tenant_id}'
+            expr_params:   过滤表达式参数绑定，如 {"tenant_id": "tenant_default"}
 
         Returns:
-            候选文档列表，每项含 "content" / "score" / "metadata"。
-            score 是 WeightedRanker 的加权排序信号，不是概率，
-            直接交给 5.7 节的 Reranker 做精细打分。
+            原始 entity 列表，每项为 dict，包含 content 及 Milvus output_fields 中的标量字段。
+            不含排序分数（分数在 Milvus 的 distance 字段中，仅用于排序，不向下传递）。
         """
         try:
             await self._ensure_loaded()
@@ -207,18 +209,12 @@ class MilvusRepository:
 
             # ── 解析结果 ───────────────────────────────────────────────
             # MilvusClient 的 hybrid_search 结果用 distance 字段存融合后的分数
-            # 这个分数是排序信号，不是概率，不做任何额外处理，直接传给 Reranker
-            candidates = []
-            for hit in results[0]:
-                entity = hit["entity"]
-                candidates.append({
-                    "content":  entity.get("content") or "",
-                    "score":    hit.get("distance") or 0.0,
-                    "metadata": ChunkMetadata.model_validate(entity),
-                })
+            # 这个分数是排序信号，不是概率，不做任何额外处理
+            # 返回原始 entity 列表，格式转换交给 retriever 层
+            entities = [hit["entity"] for hit in results[0]]
 
-            logger.info("hybrid_search.done", candidates=len(candidates))
-            return candidates
+            logger.info("hybrid_search.done", candidates=len(entities))
+            return entities
 
         except MilvusException as e:
             logger.error("hybrid_search.failed", error=str(e), exc_info=True)
@@ -237,7 +233,7 @@ if __name__ == "__main__":
         repo = MilvusRepository.from_settings()
         expr = "course_id == {course_id} and tenant_id == {tenant_id}"
         expr_params = {"course_id": "01", "tenant_id": "tenant_default"}
-        candidates = await repo._hybrid_search(
+        candidates = await repo.hybrid_search(
             dense_vector=dense,
             sparse_vector=sparse,
             top_k=3,

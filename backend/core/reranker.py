@@ -1,5 +1,7 @@
 # backend/core/reranker.py
+from __future__ import annotations
 
+import asyncio
 import os
 
 os.environ["ACCELERATE_USE_META_DEVICE"] = "0"
@@ -13,7 +15,7 @@ from backend.config import get_settings
 from backend.core.logger import get_logger
 
 logger = get_logger(__name__)
-RERANK_MAX_INPUT_CHARS = 1200   # 截断过长文档，防止超出 CrossEncoder max_length=512
+RERANK_MAX_INPUT_CHARS = 512   # 截断过长文档，防止超出 CrossEncoder max_length=512
 
 
 @dataclass
@@ -44,14 +46,11 @@ class BGEReranker:
     _instance: "BGEReranker" | None = None
 
     def __init__(self):
-        settings = get_settings()
-        model_id = settings.reranker_model_path
         device = "cuda" if torch.cuda.is_available() else "cpu"
-
-        logger.info("reranker.loading", model_id=model_id, source=settings.reranker_model_source, device=device)
-        self._model = CrossEncoder(model_id, device=device, max_length=512)
-        logger.info("reranker.loaded", model_id=model_id)
-
+        model_path = get_settings().reranker_model_path
+        self._model = CrossEncoder(model_path, device=device, max_length=512)
+        logger.info("reranker.loaded", model_path=model_path, device=device)
+        
     @classmethod
     def get_instance(cls) -> "BGEReranker":
         """获取单例，首次调用时加载模型"""
@@ -85,7 +84,7 @@ class BGEReranker:
 
         # CrossEncoder 输入：(query, document) 对，截断过长文档
         pairs = [
-            (query, (doc.get("content") or "")[:RERANK_MAX_INPUT_CHARS])
+            (query, doc["content"][:RERANK_MAX_INPUT_CHARS])
             for doc in documents
         ]
 
@@ -95,91 +94,45 @@ class BGEReranker:
         ranked = sorted(
             [
                 RankedDocument(
-                    content=documents[i].get("content", ""),
+                    content=documents[i]["content"],
                     score=scores[i],
                     original_index=i,
-                    metadata=documents[i].get("metadata", {}),
+                    metadata=documents[i]["metadata"],
                 )
                 for i in range(len(documents))
             ],
             key=lambda x: x.score,
             reverse=True,
-        )
+        )[:top_k]
 
-        top_results = ranked[:top_k]
-        confidence = top_results[0].score if top_results else 0.0
+        confidence = ranked[0].score if ranked else 0.0
 
         logger.info(
-            "reranker.done",
+            "rerank_with_confidence.done",
             candidates=len(documents),
             top_k=top_k,
             confidence=round(confidence, 4),
         )
 
-        return top_results, confidence
+        return ranked, confidence
 
-def retrieve(
-    query: str,
-    tenant_id: str,
-    course_id: str | None,
-    recall_top_k: int = 10,
-    rerank_top_k: int = 3,
-) -> tuple[list[RankedDocument], float]:
-    """
-    Hybrid 召回 → BGE 精排一体化 Pipeline。
-
-    调用方只需传 Query 文本和租户/课程参数，向量化在内部完成。
-
-    Args:
-        query:        用户 Query 文本
-        tenant_id:    租户 ID（Milvus 过滤条件）
-        course_id:    课程 ID（可选，进一步缩小检索范围）
-        recall_top_k: Hybrid 召回数量（默认 10，送给精排）
-        rerank_top_k: 精排后返回数量（默认 3，送给 LLM）
-
-    Returns:
-        (ranked_docs, confidence)
-        ranked_docs:  精排后 Top-rerank_top_k 文档
-        confidence:   Top-1 文档的 BGE 置信度 [0, 1]
-    """
-    from backend.core.embedding import BGEMEmbedder
-    from backend.core.milvus_repo import MilvusRepository  # 延迟导入，避免循环依赖
-
-    # ── 第一步：向量化（在 Pipeline 内部完成，调用方无需感知）──────
-    embedder = BGEMEmbedder.get_instance()
-    dense_vec, sparse_vec = embedder.encode_query(query)
-
-    # ── 第二步：Hybrid 召回 ─────────────────────────────────────────
-    milvus_repo = MilvusRepository.from_settings()
-    filters = milvus_repo._build_filter(tenant_id, course_id)
-    candidates = milvus_repo._hybrid_search(
-        query_embedding=dense_vec,
-        query_sparse=sparse_vec,
-        top_k=recall_top_k,
-        filters=filters,
-    )
-
-    if not candidates:
-        logger.info("retrieve.empty", query_preview=query[:50])
-        return [], 0.0
-
-    # ── 第三步：精排 ────────────────────────────────────────────────
-    reranker = BGEReranker.get_instance()
-    return reranker.rerank_with_confidence(query, candidates, top_k=rerank_top_k)
-
-
-    
 if __name__ == "__main__":
     from rich.pretty import pprint
     from backend.core.embedding import BGEMEmbedder
     from backend.core.milvus_repo import MilvusRepository
-    model = BGEMEmbedder.get_instance()
-    text = "商品聚合多模态大模型项目主要讲的是什么内容"
-    dense, sparse = model.encode_query(text)
-    kb = MilvusRepository.from_settings()
-    documents = kb._hybrid_search(dense, sparse, top_k=5)
-    model = BGEReranker.get_instance()
-    top_results, confidence = model.rerank_with_confidence(query=text, documents=documents)
-    pprint(top_results)
-    pprint(confidence)
+    
+    async def main():
+        embedder = BGEMEmbedder.get_instance()
+        query = "商品聚合多模态大模型项目主要讲的是什么内容"
+        dense, sparse = embedder.encode_query(query)
+        milvus_repo = MilvusRepository.from_settings()
+        documents = await milvus_repo.hybrid_search(dense, sparse, top_k=5)
+        reranker = BGEReranker.get_instance()
+        print(reranker)
+        ranked, confidence = reranker.rerank_with_confidence(query=query, documents=documents)
+        pprint(ranked)
+        pprint(confidence)
+        
+    asyncio.run(main())
+    
     

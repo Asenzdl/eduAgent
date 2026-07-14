@@ -18,6 +18,21 @@ class ChunkMetadata(BaseModel):
     chunk_type: ChunkType = ChunkType.TEXT
     chunk_index: int = 0
 
+    @classmethod
+    def project_from(cls, data: dict) -> dict:
+        """从任意 dict 投影出本模型声明的字段，不做校验。
+
+        用于 Milvus 读路径：entity → metadata dict，
+        只保留 ChunkMetadata 定义的字段，其他字段（content、embedding 等）自动丢弃。
+
+        Args:
+            data: 可能包含额外字段的源 dict。
+
+        Returns:
+            只含 ChunkMetadata 字段的 dict，值直接引用原 dict 对应值。
+        """
+        return {k: data[k] for k in cls.model_fields if k in data}
+
     @model_validator(mode='after')
     def _auto_document_id(self):
         """从 source 自动派生 document_id（MD5 前 12 位，幂等）。
