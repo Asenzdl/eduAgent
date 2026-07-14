@@ -41,7 +41,7 @@ _AGENT_MODEL_ROUTING: dict[str, str] = {
 
 # 模型标识符 → DeepSeek API 实际接受的 model 名称
 _MODEL_ID_MAP: dict[str, str] = {
-    "deepseek": "deepseek-chat",
+    "deepseek": "deepseek-v4-flash",
 }
 
 
@@ -63,7 +63,7 @@ class LLMFactory:
         return get_settings()
 
     @classmethod
-    def _build_model_kwargs(cls, model_key: str) -> dict[str, Any]:
+    def _build_model_kwargs(cls, model_key: str, strict: bool = False) -> dict[str, Any]:
         """内部方法：组装 init_chat_model 需要的所有参数（DeepSeek 走 OpenAI 兼容接口）。"""
         settings = cls._get_settings()             # 取配置
         model_id = _MODEL_ID_MAP[model_key]        # 把模型标识符转成 API 实际的 model 名
@@ -73,7 +73,7 @@ class LLMFactory:
             "model_provider": "openai",            # 强制走 langchain-openai（DeepSeek 兼容 OpenAI 接口）
             "temperature": 0,                      # 默认 0：评分/批改要稳定输出
             "api_key": settings.deepseek_api_key,  # 来自 .env.local
-            "base_url": settings.deepseek_base_url,# DeepSeek 接口地址
+            "base_url": settings.deepseek_base_url if not strict else "https://api.deepseek.com",  # DeepSeek 接口地址
             "max_retries": 0,                      # 模型层不重试；重试统一由 retry.py（3.5）管
             "http_async_client": _HTTP_ASYNC_CLIENT,  # 用上面绕过代理的异步客户端
             "http_client": _HTTP_SYNC_CLIENT,         # 同步客户端
@@ -85,6 +85,8 @@ class LLMFactory:
         agent_type: str,             # Agent 类型，必须在路由表里
         temperature: float = 0,      # 温度：对话类可传 0.3~0.7，评分类保持 0
         streaming: bool = False,     # 是否流式输出（问答/面试对话用）
+        think_mode: bool = False,    # 是否开启 Think 模式
+        strict: bool = False,
     ) -> BaseChatModel:
         """按 Agent 类型获取模型实例（带缓存）。
         相同 (模型, 温度, 是否流式) 的组合只会创建一次，之后复用。"""
@@ -97,19 +99,21 @@ class LLMFactory:
         model_key = _AGENT_MODEL_ROUTING[agent_type]      # 查路由表，拿到模型标识符
 
         # 用「模型_温度_是否流式」拼一个缓存键：不同组合各缓存一份
-        cache_key = f"{model_key}_{temperature}_{streaming}"
+        cache_key = f"{model_key}_{temperature}_{streaming}_{think_mode}_{strict}"
         if cache_key not in cls._instances:               # 缓存里没有才新建
-            kwargs = cls._build_model_kwargs(model_key)   # 组装基础参数
-            kwargs["temperature"] = temperature           # 覆盖温度
-            kwargs["streaming"] = streaming               # 设置是否流式
-
-            llm = init_chat_model(**kwargs)               # 真正创建模型（** 表示把字典展开成关键字参数）
+            params = cls._build_model_kwargs(model_key, strict=strict)   # 组装基础参数
+            params["temperature"] = temperature           # 覆盖温度
+            params["streaming"] = streaming               # 设置是否流式
+            if not think_mode:
+                params["extra_body"] = {"thinking": {"type": "disabled"}}
+                  
+            llm = init_chat_model(**params)               # 真正创建模型（** 表示把字典展开成关键字参数）
             cls._instances[cache_key] = llm               # 存进缓存
 
             logger.info(                                  # 记一条结构化日志，便于观察
                 "llm_factory.model_initialized",
                 agent_type=agent_type, model_key=model_key,
-                temperature=temperature, streaming=streaming,
+                temperature=temperature, streaming=streaming, think_mode=think_mode,
             )
 
         return cls._instances[cache_key]                  # 返回缓存中的实例
@@ -120,12 +124,14 @@ class LLMFactory:
         agent_type: str,
         output_schema: Type[BaseModel],   # 期望的输出结构（一个 Pydantic 模型类）
         temperature: float = 0,
+        think_mode: bool = False,
+        strict: bool = False,
     ) -> Runnable[LanguageModelInput, dict[str, Any] | BaseModel]:
         """获取「绑定了结构化输出 Schema」的模型。
         调用它的 ainvoke 后，直接返回一个 output_schema 类型的对象（不是文本）。"""
-        llm = cls.get_llm(agent_type, temperature=temperature)             # 先拿普通模型
+        llm = cls.get_llm(agent_type, temperature=temperature, think_mode=think_mode, strict=strict)             # 先拿普通模型
         # 绑定 Pydantic 结构；method="function_calling" 是 DeepSeek 必须的（回顾 2.3）
-        return llm.with_structured_output(output_schema, method="function_calling")
+        return llm.with_structured_output(output_schema, method="function_calling", strict=strict)
 
     @classmethod
     def get_configurable_llm(cls, temperature: float = 0) -> BaseChatModel:
@@ -151,14 +157,14 @@ class LLMFactory:
 # ── 模块级便捷函数（Agent 代码里的推荐写法）────────────────────────
 # 比写 LLMFactory.get_llm(...) 更简洁，直接 from llm_factory import get_llm 即可。
 
-def get_llm(agent_type: str, temperature: float = 0, streaming: bool = False) -> BaseChatModel:
+def get_llm(agent_type: str, temperature: float = 0, streaming: bool = False, think_mode: bool = False, **kwargs) -> BaseChatModel:
     """LLMFactory.get_llm 的便捷入口。"""
-    return LLMFactory.get_llm(agent_type, temperature=temperature, streaming=streaming)
+    return LLMFactory.get_llm(agent_type, temperature=temperature, streaming=streaming, think_mode=think_mode, **kwargs)
 
 
-def get_structured_llm(agent_type: str, output_schema: Type[BaseModel]) -> Runnable:
+def get_structured_llm(agent_type: str, output_schema: Type[BaseModel], think_mode: bool = False, strict: bool = False, **kwargs) -> Runnable:
     """LLMFactory.get_structured_llm 的便捷入口。"""
-    return LLMFactory.get_structured_llm(agent_type, output_schema)
+    return LLMFactory.get_structured_llm(agent_type, output_schema, think_mode=think_mode, strict=strict, **kwargs)
 
 
 

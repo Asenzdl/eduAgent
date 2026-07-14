@@ -1,6 +1,9 @@
 # backend/config.py
 # 全项目唯一的「配置中心」：从 .env.local 读取所有配置项，供任何模块取用。
 
+from typing import Literal
+
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict   # Pydantic 的「配置基类」，能自动从环境变量/.env 读取并做类型校验
 from functools import lru_cache              # 标准库装饰器：缓存函数结果，让函数实际只执行一次
 
@@ -28,6 +31,9 @@ class Settings(BaseSettings):
     # ── Milvus 向量库 ──
     milvus_host: str = "localhost"
     milvus_port: int = 19530     
+    milvus_embedding_dim: int = 1024
+    milvus_db_name: str = "eduagent"
+    milvus_collection_name: str = "knowledge_domain"
     # ── 大模型（DeepSeek）──
     deepseek_api_key: str                                   
     deepseek_base_url: str = "https://api.deepseek.com/v1"  
@@ -36,7 +42,17 @@ class Settings(BaseSettings):
     deepseek_model_coder: str = "deepseek-coder"            
 
     # ── 本地模型权重路径 ──
-    reranker_model_path: str = "models/reranker/bge-reranker-large"    # 精排模型
+    reranker_model_source: Literal["local", "online"] = "local"   # "local" | "online"
+    reranker_model_path: str = "models/reranker/bge-reranker-large"  # source 无关：最终传给 CrossEncoder 的模型标识
+    reranker_model_id: str = "BAAI/bge-reranker-v2-m3"               # online 有效：HuggingFace 模型 ID
+
+    @model_validator(mode="after")
+    def _resolve_reranker_model(self) -> "Settings":
+        """构造时一次性决定 model_path 最终值，后续访问零开销。"""
+        if self.reranker_model_source == "online":
+            self.reranker_model_path = self.reranker_model_id
+        return self
+
     classifier_model_path: str = "models/classifier/all-MiniLM-L6-v2"  # 意图分类模型
     bge_m3_model_path: str = "models/embedding/bge-m3"                 # 嵌入模型
 
