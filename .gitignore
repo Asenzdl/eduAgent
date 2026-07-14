@@ -10,7 +10,11 @@ lession/
 docs/
 models/
 .history/
-
+.playwright-mcp/
+.claude/
+.trae/
+backend/agents/qa/data/
+backend/agents/qa/parse_demo.py
 
 # Virtual environments
 .venv
