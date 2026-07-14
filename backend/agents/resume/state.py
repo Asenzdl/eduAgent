@@ -2,7 +2,7 @@ from typing import Annotated, Optional
 from typing_extensions import TypedDict
 from langgraph.graph.message import add_messages      # 消息列表的「追加」合并器（回顾 2.4 拓展）
 from langchain_core.messages import BaseMessage
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, RootModel
 
 
 # ──────────────────────────────────────────────────────────────
@@ -46,7 +46,7 @@ class ResumeStructured(BaseModel):
     email:           str  = Field(default="", description="邮箱")
     target_position: str  = Field(default="", description="求职意向岗位")
     # 教育经历（按时间倒序）
-    education:       list[EducationItem] = Field(default_factory=list)
+    education:       list[EducationItem] = Field(default_factory=list, description="教育经历列表，最高学历在最前面")
     # 技能
     skills_raw:      str       = Field(default="", description="技能栏原始文本")
     skills_list:     list[str] = Field(default_factory=list, description="解析后的技术标签列表")
@@ -75,6 +75,7 @@ class DimensionScore(BaseModel):
 
 class IssueItem(BaseModel):
     """单条诊断问题。"""
+    model_config = ConfigDict(extra="forbid")
     priority:    str = Field(description="优先级：high / medium / low")
     dimension:   str = Field(description="所属维度")
     description: str = Field(description="问题描述（1句话）")
@@ -86,11 +87,25 @@ class IssueList(BaseModel):
     """IssueItem 列表的包装类。
     为什么要包一层：with_structured_output 要求顶层是「对象」而非「裸列表」，
     所以不能直接让 LLM 返回 list[IssueItem]，要包成 {items: [...]}。"""
+    model_config = ConfigDict(extra="forbid")
     items: list[IssueItem]
+
+# class IssueList(RootModel[list[IssueItem]]):
+#     """问题列表包装类。
+#     继承 RootModel 后，LangChain 仍能正常解析（因为它是个对象），
+#     但我们在代码中可以直接把它当列表用！
+#     """
+#     # 可选：给模型加描述，提升输出质量
+#     model_config = {
+#         "json_schema_extra": {
+#             "description": "A list of issues extracted from the text."
+#         }
+#     }
 
 
 class ResumeSummary(BaseModel):
     """简历整体评价——generate_summary 节点的输出目标。"""
+    model_config = ConfigDict(extra="forbid")
     highlights:        list[str] = Field(description="2-3 条核心亮点")
     core_improvements: list[str] = Field(description="2-3 条最重要的改进方向")
     overall_comment:   str       = Field(description="1-2 句综合评语")
@@ -118,6 +133,7 @@ class ResumeState(TypedDict):
 
     # ── 结构化提取结果 ──
     structured:     Optional[dict]   # extract_structured 产出：ResumeStructured.model_dump()
+    structured_summary: Optional[str]  
 
     # ── 六维度评审结果 ──
     dimension_scores: list[dict]     # run_six_dimensions 产出：六维度各一条
