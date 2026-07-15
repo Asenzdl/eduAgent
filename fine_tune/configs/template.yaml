@@ -1,0 +1,26 @@
+# config.yaml
+trainer:
+  num_epochs: 4
+  batch_size: 16
+  lr: 0.00002
+  warmup_ratio: 0.1
+  weight_decay: 0.01
+  seed: 42
+
+data:
+  raw_datapath: "data/raw_data.jsonl"
+  train_datapath: ""
+  dev_datapath: ""
+  test_datapath: ""
+  label_map_path: "data/label_map.json"
+  max_length: 32
+
+model:
+  bert_path: "models/raw_models/all-MiniLM-L6-v2"
+  hidden_size: 384
+  model_type: "bert"
+
+output:
+  model_save_path: "models/checkpoints/all-MiniLM-L6-v2-finetuned"
+  quant_model_path: "models/checkpoints/all-MiniLM-L6-v2-quantized"
+

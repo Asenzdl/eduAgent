@@ -713,6 +713,7 @@ dependencies = [
     { name = "asyncpg" },
     { name = "duckduckgo-search" },
     { name = "environs" },
+    { name = "evaluate" },
     { name = "fastapi" },
     { name = "flagembedding" },
     { name = "httpx" },
@@ -756,6 +757,7 @@ requires-dist = [
     { name = "asyncpg", specifier = ">=0.31.0" },
     { name = "duckduckgo-search", specifier = ">=8.1.1" },
     { name = "environs", specifier = ">=15.0.1" },
+    { name = "evaluate", specifier = ">=0.4.6" },
     { name = "fastapi", specifier = ">=0.138.1" },
     { name = "flagembedding", specifier = ">=1.4.0" },
     { name = "httpx", specifier = ">=0.28.1" },
@@ -804,6 +806,28 @@ dependencies = [
 sdist = { url = "https://mirrors.aliyun.com/pypi/packages/c5/f4/0273d36ab287a00866b69d4008e2ed2e479e4bc1eef4f8be2708f30ad15f/environs-15.0.1.tar.gz", hash = "sha256:638106bfb5d8c9a13ee51c23a9f2416baf9a748c8e537fec771102927cd02aa8" }
 wheels = [
     { url = "https://mirrors.aliyun.com/pypi/packages/49/fb/11e461eb609792f9f439398eb5f400fb4130ff2b9b59e0ceb346bb830a17/environs-15.0.1-py3-none-any.whl", hash = "sha256:a6aeb3e18d5649a4e74f62984f0d84ec869269cff588a43685272c72b5b8979b" },
+]
+
+[[package]]
+name = "evaluate"
+version = "0.4.6"
+source = { registry = "https://mirrors.aliyun.com/pypi/simple/" }
+dependencies = [
+    { name = "datasets" },
+    { name = "dill" },
+    { name = "fsspec", extra = ["http"] },
+    { name = "huggingface-hub" },
+    { name = "multiprocess" },
+    { name = "numpy" },
+    { name = "packaging" },
+    { name = "pandas" },
+    { name = "requests" },
+    { name = "tqdm" },
+    { name = "xxhash" },
+]
+sdist = { url = "https://mirrors.aliyun.com/pypi/packages/ad/d0/0c17a8e6e8dc7245f22dea860557c32bae50fc4d287ae030cb0e8ab8720f/evaluate-0.4.6.tar.gz", hash = "sha256:e07036ca12b3c24331f83ab787f21cc2dbf3631813a1631e63e40897c69a3f21" }
+wheels = [
+    { url = "https://mirrors.aliyun.com/pypi/packages/3e/af/3e990d8d4002bbc9342adb4facd59506e653da93b2417de0fa6027cb86b1/evaluate-0.4.6-py3-none-any.whl", hash = "sha256:bca85bc294f338377b7ac2f861e21c308b11b2a285f510d7d5394d5df437db29" },
 ]
 
 [[package]]
