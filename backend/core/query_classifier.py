@@ -100,8 +100,8 @@ def get_query_classifier() -> _QueryClassifier:
     """懒加载获取 QueryClassifier 单例"""
     
     global _classifier
-    if _classifier is None:          # 第一次检查（无锁）
-            _classifier = _QueryClassifier(get_settings().classifier_model_path)
+    if _classifier is None:          
+        _classifier = _QueryClassifier(get_settings().classifier_model_path)
     return _classifier
 
 
