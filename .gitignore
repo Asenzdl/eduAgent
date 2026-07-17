@@ -19,4 +19,4 @@ backend/agents/qa/parse_demo.py
 # Virtual environments
 .venv
 .env
-.env.local
+.env.local.DS_Store
