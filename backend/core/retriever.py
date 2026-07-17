@@ -5,6 +5,8 @@
 调用方只需传 Query 文本和租户/课程范围，不感知内部组件。
 """
 
+import asyncio
+
 from backend.core.embedding import BGEMEmbedder
 from backend.core.logger import get_logger
 from backend.core.milvus_repo import MilvusRepository
@@ -33,7 +35,17 @@ async def _search(
         下游 Reranker 可直接消费。
     """
     embedder = BGEMEmbedder.get_instance()
-    dense_vec, sparse_vec = embedder.encode_query(query)
+    # 方法一：直接调用 Embedder 方法
+    # dense_vec, sparse_vec = embedder.encode_query(query)
+    
+    # 方法二：使用 run_in_executor 异步调用 Embedder 方法
+    # loop = asyncio.get_running_loop()
+    # dense_vec, sparse_vec = await loop.run_in_executor(
+    #     None, lambda: embedder.encode_query(query)
+    # )
+    
+    # 方法三：使用 to_thread 异步调用 Embedder 方法
+    dense_vec, sparse_vec = await asyncio.to_thread(embedder.encode_query, query)
 
     # ── 构建 Milvus 标量过滤表达式（参数化绑定，防注入）──────────────
     expr_params: dict[str, str] = {"tenant_id": tenant_id}
@@ -79,7 +91,19 @@ async def retrieve(
         return [], 0.0
 
     reranker = BGEReranker.get_instance()
-    return reranker.rerank_with_confidence(query, candidates, top_k=rerank_top_k)
+    # 方法一：直接调用 Reranker 方法
+    # return reranker.rerank_with_confidence(query, candidates, top_k=rerank_top_k)
+    
+    # 方法二：使用 run_in_executor 异步调用 Reranker 方法
+    # loop = asyncio.get_running_loop()
+    # ranked_docs, confidence = await loop.run_in_executor(
+    #     None, lambda: reranker.rerank_with_confidence(query, candidates, top_k=rerank_top_k)
+    # )
+    # return ranked_docs, confidence
+    
+    # 方法三：使用 to_thread 异步调用 Reranker 方法
+    ranked_docs, confidence = await asyncio.to_thread(reranker.rerank_with_confidence, query, candidates, rerank_top_k)
+    return ranked_docs, confidence
 
 
 if __name__ == "__main__":

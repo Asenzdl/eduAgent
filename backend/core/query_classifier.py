@@ -1,11 +1,10 @@
 from __future__ import annotations
+
+import torch
 from backend.config import get_settings
 from backend.core.logger import get_logger
 
 logger = get_logger(__name__)
-
-LABEL2ID = {"general": 0, "specialized": 1}
-ID2LABEL = {0: "general", 1: "specialized"}
 
 # general 侧置信度阈值设为 0.85（偏高）：
 # 专业问题被误判为通用问题的代价更高——LLM 会用自身知识回答，
@@ -13,7 +12,7 @@ ID2LABEL = {0: "general", 1: "specialized"}
 GENERAL_CONFIDENCE_THRESHOLD = 0.85
 
 
-class QueryClassifier:
+class _QueryClassifier:
     """
     QA Query 二分类器：general / specialized（推理专用）。
 
@@ -25,16 +24,13 @@ class QueryClassifier:
     训练请运行：
         python scripts/train_classifier.py --data-path backend/training_data.jsonl
     """
-
-    _instance: "QueryClassifier" | None = None
-
+    
     def __init__(self, model_path: str):
         """
         Args:
-            model_path: 微调模型路径（由 get_instance 从配置读取后传入）。
-        """
-        # device = "cuda" if torch.cuda.is_available() else "cpu"
-        device = 'cpu'
+            model_path: 微调模型路径（由 get_query_classifier 从配置读取后传入）。
+        # """
+        device = "cuda" if torch.cuda.is_available() else "cpu"
         from transformers import pipeline as hf_pipeline
 
         self._pipeline = hf_pipeline(
@@ -47,13 +43,6 @@ class QueryClassifier:
         )
         
         logger.info("query_classifier.init", model_path=model_path, device=device)
-
-    @classmethod
-    def get_instance(cls) -> QueryClassifier:
-        """获取单例（首次调用时懒加载）"""
-        if cls._instance is None:
-            cls._instance = cls(get_settings().classifier_model_path)
-        return cls._instance
 
     # ── 推理 ─────────────────────────────────────────────────
 
@@ -75,12 +64,8 @@ class QueryClassifier:
         #   {'label': 'specialized', 'score': 0.9900947213172913}, 
         #   {'label': 'general', 'score': 0.009905257262289524}
         # ]
-        import time
-        start = time.perf_counter()
         raw_outputs: list[dict] = self._pipeline(text)[0]
-        end = time.perf_counter()
-        print(f"pipeline 推理耗时：{end - start:.4f} 秒")
-
+  
         # 查找 general 标签的分数（兼容大小写和 LABEL_0 格式）
         # 解析 pipeline 输出，按标签名称索引分数
         scores = {item["label"].lower(): item["score"] for item in raw_outputs}
@@ -107,37 +92,47 @@ class QueryClassifier:
         return label, confidence
 
 
-# ── 模块级单例（供 nodes.py import 调用）───────────────────────
+# ── 模块级单例 ─────────────────────────────────────
 
-_classifier: QueryClassifier | None = None
+_classifier: _QueryClassifier | None = None
 
-
-def get_query_classifier() -> QueryClassifier:
-    """获取 QueryClassifier 单例"""
+def get_query_classifier() -> _QueryClassifier:
+    """懒加载获取 QueryClassifier 单例"""
+    
     global _classifier
-    if _classifier is None:
-        _classifier = QueryClassifier.get_instance()
+    if _classifier is None:          # 第一次检查（无锁）
+            _classifier = _QueryClassifier(get_settings().classifier_model_path)
     return _classifier
 
 
+def reset_classifier() -> None:
+    """仅供测试使用"""
+    global _classifier
+    _classifier = None
+
+
 if __name__ == "__main__":
-    qc = QueryClassifier.get_instance()
+    qc = get_query_classifier()
     import time
     start = time.perf_counter()
     label, confidence = qc.classify("混淆矩阵可视化代码在哪里")
     end = time.perf_counter()
     print(f"classify 推理耗时：{end - start:.4f} 秒")
     print((label, confidence))
-    """
+    r"""
     2026-07-15 18:15:02 [info     ] query_classifier.init          device=cuda model_path=D:\wjs\program\cc\eduAgent\models\classifier\all-MiniLM-L6-v2-finetuned
-    pipeline 推理耗时：0.2453 秒
-    2026-07-15 18:15:02 [info     ] query_classifier.result        confidence=0.9901 label=specialized text_preview=混淆矩阵可视化代码在哪里
-    classify 推理耗时：0.2456 秒
+    2026-07-15 19:02:49 [info     ] query_classifier.init          device=cuda model_path=D:\wjs\program\cc\eduAgent\models\classifier\all-MiniLM-L6-v2-finetuned
+    pipeline 推理耗时：0.3118 秒
+    pipeline 推理耗时：0.0039 秒
+    2026-07-15 19:02:49 [info     ] query_classifier.result        confidence=0.9901 label=specialized text_preview=混淆矩阵可视化代码在哪里
+    classify 推理耗时：0.3161 秒
     ('specialized', 0.9900947427377105)
     
-    2026-07-15 18:15:27 [info     ] query_classifier.init          device=cpu model_path=D:\wjs\program\cc\eduAgent\models\classifier\all-MiniLM-L6-v2-finetuned
-    pipeline 推理耗时：0.0658 秒
-    2026-07-15 18:15:27 [info     ] query_classifier.result        confidence=0.9901 label=specialized text_preview=混淆矩阵可视化代码在哪里
-    classify 推理耗时：0.0661 秒
+    2026-07-15 18:15:02 [info     ] query_classifier.init          device=cuda model_path=D:\wjs\program\cc\eduAgent\models\classifier\all-MiniLM-L6-v2-finetuned
+    2026-07-15 19:04:02 [info     ] query_classifier.init          device=cpu model_path=D:\wjs\program\cc\eduAgent\models\classifier\all-MiniLM-L6-v2-finetuned
+    pipeline 推理耗时：0.0649 秒
+    pipeline 推理耗时：0.0056 秒
+    2026-07-15 19:04:02 [info     ] query_classifier.result        confidence=0.9901 label=specialized text_preview=混淆矩阵可视化代码在哪里
+    classify 推理耗时：0.0709 秒
     ('specialized', 0.9900947334244847)
     """

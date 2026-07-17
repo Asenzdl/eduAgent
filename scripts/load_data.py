@@ -108,29 +108,28 @@ def split_markdown(
         length_function=len,
     )
 
-    def _wrap_chunk(raw: Document, idx: int) -> DocumentChunk:
+    def _wrap_chunk(raw: Document, idx: int, filename: str) -> DocumentChunk:
         """将 raw Document 包装为 DocumentChunk（embedding=None）。"""
         title_content = [raw.metadata[h] for _, h in MARKDOWN_HEADERS if raw.metadata.get(h)]
         source_name = f"{filename} > {' > '.join(title_content)}" if title_content else filename
         return DocumentChunk(
-            source=source, course_id=course_id, content=raw.page_content,
+            source=raw.metadata.get("source"), course_id=course_id, content=raw.page_content,
             source_name=source_name, chunk_type=raw.metadata.get("chunk_type", "text"),
             chunk_index=idx, version=version, tenant_id=tenant_id,
         )
 
     groups: list[DocumentGroup] = []
     for doc in docs:
-        source = doc.metadata.get("source", "unknown")
-        filename = Path(source).stem if source else "未知文件"
-
         # 按标题切分
         sections = markdown_splitter.split_text(doc.page_content)
         for section in sections:
             section.metadata.update(**doc.metadata)
 
         # 超长块再按文本切分 → 包装为 DocumentChunk
+        source = doc.metadata.get("source", "unknown")
+        filename = Path(source).stem if source else "未知文件"
         chunks = [
-            _wrap_chunk(raw, idx)
+            _wrap_chunk(raw, idx, filename)
             for idx, raw in enumerate(recursive_splitter.split_documents(sections))
         ]
 

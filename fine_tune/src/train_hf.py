@@ -23,7 +23,6 @@ import evaluate
 
 
 from fine_tune.src.config import load_config
-from fine_tune.src.utils import check_resume
 
 
 # ── 评估指标 ──────────────────────────────────────────────
@@ -114,9 +113,14 @@ def train():
     
     # 3. Tokenize
     tokenizer = AutoTokenizer.from_pretrained(cfg.model.bert_path)
-
-    def tokenize_fn(examples):
-        return tokenizer(examples["text"], truncation=True, max_length=cfg.data.max_length)
+    
+    def tokenize_fn(batch):
+        """batch: Dataset({
+            features: ['text', 'label', 'input_ids', 'attention_mask', 'token_type_ids']
+            num_rows: len(batch)
+        })
+        """
+        return tokenizer(batch["text"], truncation=True, max_length=cfg.data.max_length)
 
     train_data = train_data.map(tokenize_fn, batched=True, remove_columns=["text"])
     val_data = val_data.map(tokenize_fn, batched=True, remove_columns=["text"])
