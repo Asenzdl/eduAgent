@@ -40,9 +40,9 @@ def build_thread_id(student_id: str, session_id: str) -> str:
 
     Example:
         build_thread_id("abc123", "xyz789")
-        → "student_abc123_session_xyz789"
+        → "student_abc123:session_xyz789"
     """
-    return f"student_{student_id}_session_{session_id}"
+    return f"student_{student_id}:session_{session_id}"
 
 
 def build_config(student_id: str, session_id: str) -> dict:
