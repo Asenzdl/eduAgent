@@ -1,91 +1,28 @@
 # backend/api/v1/qa.py
 
 import json
-from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Depends
 from sse_starlette.sse import EventSourceResponse
 from langchain_core.messages import HumanMessage
 
+from backend.schemas.qa import ChatRequest, ChatResponse, HistoryResponse, SessionMessage
+from backend.dependencies import get_current_user, UserContext
+from backend.services.qa import run_qa
 from backend.agents.qa.graph import build_qa_graph
-from backend.core.memory import build_thread_id
-from backend.dependencies import get_current_user
+from backend.services.qa import build_thread_id
 from backend.core.logger import get_logger
 
 router = APIRouter()
 logger = get_logger(__name__)
 
 
-# ── 请求 / 响应模型 ───────────────────────────────────────────
-
-class ChatRequest(BaseModel):
-    session_id:        str        = Field(..., description="会话 ID")
-    course_id:         str | None = Field(None, description="课程 ID（可选，限定检索范围）")
-    message:           str        = Field(..., min_length=1, max_length=2000)
-    enable_web_search: bool       = Field(False, description="低置信度时是否先走 Web Search 再给 LLM")
-
-
-class ChatResponse(BaseModel):
-    session_id:    str
-    answer:        str
-    answer_mode:   str        # "rag" / "web_augmented" / "llm_direct" / "general"
-    confidence:    float
-    sources:       list[str]
-    fallback_used: bool
-
-
-class SessionMessage(BaseModel):
-    role:       str   # "user" / "assistant"
-    content:    str
-    created_at: str
-
-
-class HistoryResponse(BaseModel):
-    session_id:  str
-    messages:    list[SessionMessage]
-    summary:     str | None
-    total_turns: int
-
-
-
 @router.post("/chat", response_model=ChatResponse)
 async def chat(
     req: ChatRequest,
-    current_user: dict = Depends(get_current_user),
+    current_user: UserContext = Depends(get_current_user),
 ):
     """智能问答：发送消息，获取 RAG 或 LLM 直答（非流式）"""
-    graph     = build_qa_graph()
-    thread_id = build_thread_id(current_user["user_id"], req.session_id)
-
-    initial_state = {
-        "messages":            [HumanMessage(content=req.message)],
-        "student_id":          current_user["user_id"],
-        "tenant_id":           current_user["tenant_id"],
-        "session_id":          req.session_id,
-        "course_id":           req.course_id,
-        "query_type":          "PRECISE",     # 占位初始值，classify_query_node 内部会动态覆盖
-        "enable_web_search":   req.enable_web_search,
-        "web_search_results":  [],            # 每轮重置，防止上轮搜索结果污染本轮 sources
-    }
-    config: dict = {"configurable": {"thread_id": thread_id}}
-
-    try:
-        result = await graph.ainvoke(initial_state, config=config)
-    except Exception as e:
-        logger.error("chat.invoke_error", error=str(e), exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail={"code": "AGENT_ERROR", "message": str(e)},
-        )
-
-    return ChatResponse(
-        session_id=req.session_id,
-        answer=result.get("answer", ""),
-        answer_mode=result.get("answer_mode", "llm_direct"),
-        confidence=result.get("confidence", 0.0),
-        sources=result.get("sources", []),
-        fallback_used=result.get("fallback_used", False),
-    )
-
+    return await run_qa(req, current_user)
 
 
 @router.post("/chat/stream")

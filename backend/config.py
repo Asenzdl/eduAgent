@@ -28,6 +28,17 @@ class Settings(BaseSettings):
             f"@{self.db_host}:{self.db_port}/{self.db_name}"
         )
 
+    @property
+    def checkpointer_database_url(self) -> str:
+        """LangGraph Checkpointer 用的纯 postgresql 连接串（psycopg 驱动）。
+
+        AsyncPostgresSaver 底层用 psycopg，不接受 +asyncpg 后缀。
+        """
+        return (
+            f"postgresql://{self.db_user}:{self.db_password}"
+            f"@{self.db_host}:{self.db_port}/{self.db_name}"
+        )
+
     # ── Milvus 向量库 ──
     milvus_host: str = "localhost"
     milvus_port: int = 19530     

@@ -7,6 +7,8 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials  # 解析 
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from jose import JWTError, jwt                       # python-jose：JWT 的编解码库
 
+from pydantic import BaseModel
+
 from backend.config import get_settings
 
 settings = get_settings()
@@ -36,12 +38,26 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 bearer_scheme = HTTPBearer()   # FastAPI 安全方案：自动从请求头解析 "Authorization: Bearer <token>"
 
 
+class UserContext(BaseModel):
+    """JWT 解析后的用户上下文，替代裸 dict 在路由间传递。
+
+    提供 __getitem__ 兼容桥，让旧写法 current_user["user_id"]
+    在新路由迁移完成前仍可工作。
+    """
+    user_id: str
+    role: str = "student"
+    tenant_id: str
+
+    def __getitem__(self, key: str) -> str:
+        return getattr(self, key)
+
+
 async def get_current_user(
     # Depends(bearer_scheme)：FastAPI 自动取出 Bearer Token；没带或格式错会直接 401
     credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
-) -> dict:
+) -> UserContext:
     """FastAPI 依赖：验证 JWT Token，返回当前用户信息。
-    返回 {"user_id": str, "role": str, "tenant_id": str}；Token 无效则抛 401。"""
+    返回 UserContext(user_id, role, tenant_id)；Token 无效则抛 401。"""
     # 预先准备好「401 凭证无效」异常，多处复用
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -65,7 +81,7 @@ async def get_current_user(
     except JWTError:                            # 解码失败（签名错/过期等）
         raise credentials_exception
 
-    return {"user_id": user_id, "role": role, "tenant_id": tenant_id}
+    return UserContext(user_id=user_id, role=role, tenant_id=tenant_id)
 
 if __name__ == "__main__":
     import asyncio

@@ -5,8 +5,9 @@ import uuid
 
 from sqlalchemy import text
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage, ToolMessage
+from langgraph.runtime import Runtime
 
-from backend.agents.qa.state import QAState
+from backend.agents.qa.state import QAState, QAContext, Intent, RAGStrategy
 from backend.agents.qa.prompts import (
     HYDE_PROMPT,
     MULTI_QUERY_REWRITE_PROMPT,
@@ -21,7 +22,6 @@ from backend.core.memory import (
     trim_messages_to_window,
     should_trigger_summary,
     compress_to_summary,
-    build_thread_id,
 )
 from backend.config import get_settings
 from backend.core.logger import get_logger
@@ -35,6 +35,7 @@ RECALL_TOP_K_PRECISE     = 8   # PRECISE：直接检索召回数
 RECALL_TOP_K_VAGUE       = 10  # VAGUE：HyDE 语义扩充后多召回些
 RECALL_TOP_K_BROAD_PER   = 4   # BROAD：每个子 Query 的召回数
 RERANK_TOP_K             = 3   # 精排后保留的最终 chunk 数
+_RAG_RULE_LOW_CONF_MIN_LEN = 18  # 规则判 VAGUE/BROAD 时，查询短于此值跳过 LLM（短查询 LLM 也判不准）
 
 
 
@@ -85,37 +86,6 @@ def _build_system_content(summary: str | None = None) -> str:
     if summary:
         content += f"\n\n【学员历史学习摘要】\n{summary}"
     return content
-
-
-# ──────────────────────────────────────────────────────────────
-# 联网请求自动识别
-# ──────────────────────────────────────────────────────────────
-
-_WEB_SEARCH_HINTS = (
-    "联网", "联网查询", "联网搜索", "上网查", "上网搜", "网上搜",
-    "搜索一下", "可以搜索", "帮我搜", "百度一下", "谷歌一下",
-)
-
-def _extract_query_and_web_flag(raw: str) -> tuple[str, bool]:
-    """
-    检测用户消息是否含联网请求指令。
-    返回 (清洗后的问题, 是否自动启用联网)。
-
-    联网指令部分被去除，防止被 LLM 当作问题内容处理。
-    例："Spring AOP 是什么，如果不知道可以联网搜索"
-      → ("Spring AOP 是什么", True)
-    """
-    import re
-    needs_web = any(h in raw for h in _WEB_SEARCH_HINTS)
-    if not needs_web:
-        return raw, False
-    clean = re.sub(
-        r'[，,。.？?！!\s]*(?:如果不知道|不知道的话|不清楚|你可以|可以)?'
-        r'(?:联网|上网|网上)?(?:查询|搜索|搜一下|查一查|百度|谷歌).*$',
-        '', raw,
-    ).strip()
-    return (clean or raw), True
-
 
 
 # ──────────────────────────────────────────────────────────────
@@ -222,18 +192,42 @@ def _rule_classify_specialized(query: str) -> bool:
     return any(kw in q for kw in _SPECIALIZED_KEYWORDS)
 
 
-def _fast_rag_strategy(query: str) -> str:
-    """规则快判 RAG 策略（< 1ms）"""
+def _rule_classify(query: str) -> str:
+    """规则层分类：返回 GENERAL / SPECIALIZED / UNKNOWN"""
+    if _rule_classify_general(query):
+        return "GENERAL"
+    if _rule_classify_specialized(query):
+        return "SPECIALIZED"
+    return "UNKNOWN"
+
+
+def _rule_rag_strategy(query: str) -> str:
+    """
+    规则快判 RAG 策略（< 1ms）。
+
+    分支顺序（第一条命中即返回，后续不检查）：
+      ① VAGUE   → 查询含「没懂/解释一下/啥意思」等模糊信号词。
+                   排在 BROAD 之前，因为「全面总结一下归一化」既含 VAGUE
+                   也含 BROAD 信号，应该优先处理"表达不清"的语义。
+      ② BROAD   → 查询含「全面/系统/对比/有哪些」等系统梳理信号。
+                   排在 VAGUE 之后，仅在无模糊歧义时才走宽泛改写。
+      ③ PRECISE → 默认分支。无任何信号词命中时，认为查询意图明确，
+                   直接精确检索，不引入重写/扩写的开销。
+
+    注意：此函数只查信号词是否存在，不做否定推断——
+    例如「"没懂"的反义词是什么」含 VAGUE 词但意图明确，
+    会在 _determine_rag_strategy_llm 中被 LLM 校正为 PRECISE。
+    """
     q = query.strip().lower()
-    if len(q) <= 6 and any(kw in q for kw in _VAGUE_QUERY_HINTS):
+    if any(kw in q for kw in _VAGUE_QUERY_HINTS):
         return "VAGUE"
     if any(kw in q for kw in _BROAD_QUERY_HINTS):
         return "BROAD"
     return "PRECISE"
 
 
-async def _determine_rag_strategy(query: str) -> str:
-    """LLM 精判 RAG 策略（仅在规则判为 VAGUE/BROAD 且问题较长时调用）"""
+async def _determine_rag_strategy_llm(query: str) -> str | None:
+    """LLM 精判 RAG 策略。失败返回 None，由调用方决定兜底。"""
     try:
         llm = get_llm("qa", temperature=0)
         resp = await llm.ainvoke([
@@ -242,23 +236,26 @@ async def _determine_rag_strategy(query: str) -> str:
         label = resp.content.strip().upper()
         if label in ("PRECISE", "VAGUE", "BROAD"):
             return label
-    except Exception as e:
-        logger.warning("classify_query.rag_strategy_failed", error=str(e))
-    return "PRECISE"   # 兜底：最保守策略
+    except Exception:
+        logger.warning("llm_classification_failed", query=query, exc_info=True)
+    return None
 
 
-async def _determine_rag_strategy_fast(query: str) -> str:
+async def _resolve_rag_strategy(query: str) -> str:
     """
     两阶段策略判定：
-    ① 规则快判 → 若为 PRECISE，直接返回（不调 LLM）
-    ② 规则判为 VAGUE/BROAD 且问题较长（≥18字）→ LLM 校正（避免误判）
-    ③ 规则判为 VAGUE/BROAD 且问题极短 → 直接相信规则
+      ① 规则判 PRECISE → 直接采信（不调 LLM）
+      ② 规则判 VAGUE/BROAD + 查询够长（≥18字）→ LLM 校正，LLM 失败退回规则
+      ③ 规则判 VAGUE/BROAD + 查询太短 → 跳过 LLM（短查询 LLM 也判不准），采信规则
     """
-    strategy = _fast_rag_strategy(query)
+    strategy = _rule_rag_strategy(query)
+
     if strategy == "PRECISE":
         return strategy
-    if len(query.strip()) >= 18:
-        return await _determine_rag_strategy(query)
+
+    if len(query.strip()) >= _RAG_RULE_LOW_CONF_MIN_LEN:
+        return await _determine_rag_strategy_llm(query) or strategy
+
     return strategy
 
 
@@ -266,88 +263,48 @@ async def _determine_rag_strategy_fast(query: str) -> str:
 # 节点：classify_query — Query 类型判断（含历史摘要加载）
 # ──────────────────────────────────────────────────────────────
 
-async def classify_query_node(state: QAState) -> dict:
+async def classify_query_node(state: QAState, runtime: Runtime[QAContext]) -> dict:
     """
     Query 分类节点，决定走哪条处理路径。
 
-    同时负责从 DB 加载当前会话的历史摘要（合并了源码中的 load_memory 节点）。
+    两阶段流水线：
+      Phase A — 规则快判（0 µs，确定性）
+      Phase B — MiniLM 语义分类（~5ms CPU 推理，仅规则判 UNKNOWN 时触发）
 
-    返回的 query_type：
-      GENERAL  → 跳过 RAG，直接 LLM 回答
-      PRECISE  → 直接向量检索
-      VAGUE    → 先 HyDE 再检索
-      BROAD    → 先 Multi-Query 改写再并行检索
+    历史摘要通过 state.summary 从 checkpointer 获取，不再单独查 DB。
+    original_query 由 InputSchema 注入，不经由 messages[-1] 提取。
+
+    返回两个正交维度的字段：
+      intent       — GENERAL（跳过 RAG）/ SPECIALIZED（进入检索链）
+      rag_strategy — 仅 intent=SPECIALIZED 时有值：
+                       PRECISE → 直接向量检索
+                       VAGUE   → 先 HyDE 再检索
+                       BROAD   → 先 Multi-Query 改写再并行检索
+                     intent=GENERAL 时不写入，保持 None。
     """
-    # ── 取最后一条 HumanMessage 作为原始输入 ─────────────────
-    messages = state.get("messages", [])
-    raw_query = ""
-    for msg in reversed(messages):
-        if isinstance(msg, HumanMessage):
-            raw_query = msg.content
-            break
+    original_query = state["original_query"]
 
-    # ── 联网指令识别 ──────────────────────────────────────────
-    original_query, auto_web = _extract_query_and_web_flag(raw_query)
+    # ── Phase A：规则快判（GENERAL / SPECIALIZED / UNKNOWN）──────
+    stage = _rule_classify(original_query)
 
-    # ── 从 DB 加载历史摘要（取代 load_memory_and_embed_node）──
-    existing_summary: str | None = None
-    try:
-        from backend.dependencies import AsyncSessionLocal
-        thread_id = build_thread_id(state["student_id"], state["session_id"])
-        async with AsyncSessionLocal() as db:
-            row = (await db.execute(
-                text("SELECT summary FROM qa_sessions WHERE thread_id = :tid"),
-                {"tid": thread_id},
-            )).fetchone()
-            existing_summary = row[0] if row else None
-    except Exception as e:
-        logger.warning("classify_query.load_memory_failed", error=str(e))
-
-    _base: dict = {
-        "original_query":    original_query,
-        "existing_summary":  existing_summary,
-        "rewritten_queries": [],
-        "hyde_document":     None,
-    }
-    if auto_web and not state.get("enable_web_search", False):
-        _base["enable_web_search"] = True
-        logger.info("classify_query.auto_web_enabled", query=original_query[:50])
-
-    # ── Layer 0a：规则 → GENERAL（闲聊/时间/打招呼）───────────
-    if _rule_classify_general(original_query):
-        logger.info("classify_query.general_by_rule", query=original_query[:50])
-        return {**_base, "query_type": "GENERAL"}
-
-    # ── Layer 0b：关键词快速通道 → 专业（课程/项目词）──────────
-    if _rule_classify_specialized(original_query):
-        logger.info("classify_query.specialized_by_keyword", query=original_query[:50])
-        strategy = await _determine_rag_strategy_fast(original_query)
-        logger.info("classify_query.rag_strategy", strategy=strategy)
-        return {**_base, "query_type": strategy}
-
-    # ── Layer 1：MiniLM 二分类（CPU 推理，线程池避免阻塞）──────
-    loop = asyncio.get_running_loop()
-    label, confidence = await loop.run_in_executor(
-        None, get_query_classifier().classify, original_query
-    )
-
-    if label == "general":
-        logger.info(
-            "classify_query.general_by_minilm",
-            query=original_query[:50],
-            confidence=round(confidence, 4),
+    # ── Phase B：规则判 UNKNOWN → MiniLM 语义分类 ──────────────
+    if stage == "UNKNOWN":
+        loop = asyncio.get_running_loop()
+        label, confidence = await loop.run_in_executor(
+            None, get_query_classifier().classify, original_query
         )
-        return {**_base, "query_type": "GENERAL"}
+        stage = "GENERAL" if label == "general" else "SPECIALIZED"
+        logger.info("query_classified", query=original_query, intent=stage,
+                    classifier='MiniLM', confidence=confidence)
 
-    # ── Layer 2：MiniLM → 专业，LLM 判检索策略 ──────────────
-    logger.info(
-        "classify_query.specialized_by_minilm",
-        query=original_query[:50],
-        confidence=round(confidence, 4),
-    )
-    strategy = await _determine_rag_strategy_fast(original_query)
-    logger.info("classify_query.rag_strategy", strategy=strategy)
-    return {**_base, "query_type": strategy}
+    # ── GENERAL：跳过 RAG，不判定 rag_strategy ─────────────────
+    if stage == "GENERAL":
+        return {"intent": Intent.GENERAL}
+
+    # ── SPECIALIZED：判定 RAG 检索策略 ────────────────────────
+    strategy = await _resolve_rag_strategy(original_query)
+    logger.info("rag_strategy_decided", query=original_query, rag_strategy=strategy)
+    return {"intent": Intent.SPECIALIZED, "rag_strategy": RAGStrategy(strategy)}
 
 
 # ──────────────────────────────────────────────────────────────
@@ -452,7 +409,7 @@ async def retrieve_node(state: QAState) -> dict:
     from backend.core.retriever import retrieve
     from backend.core.reranker import RankedDocument
 
-    query_type     = state.get("query_type", "PRECISE").upper()
+    rag_strategy   = state.get("rag_strategy", RAGStrategy.PRECISE)
     tenant_id      = state["tenant_id"]
     course_id      = state.get("course_id")
     original_query = state["original_query"]
@@ -460,7 +417,7 @@ async def retrieve_node(state: QAState) -> dict:
     loop = asyncio.get_running_loop()
 
     # ── BROAD：并行多 Query 检索，合并去重 ───────────────────────
-    if query_type == "BROAD" and state.get("rewritten_queries"):
+    if rag_strategy == RAGStrategy.BROAD and state.get("rewritten_queries"):
         broad_queries = state["rewritten_queries"][:MAX_BROAD_QUERIES]
 
         async def retrieve_one(sub_query: str) -> tuple[list, float]:
@@ -489,7 +446,7 @@ async def retrieve_node(state: QAState) -> dict:
 
     # ── PRECISE / VAGUE：单路检索 ─────────────────────────────────
     else:
-        if query_type == "VAGUE" and state.get("hyde_document"):
+        if rag_strategy == RAGStrategy.VAGUE and state.get("hyde_document"):
             query_text   = state["hyde_document"]
             recall_top_k = RECALL_TOP_K_VAGUE
         else:
@@ -522,7 +479,7 @@ async def retrieve_node(state: QAState) -> dict:
 
     logger.info(
         "retrieve.done",
-        query_type=query_type,
+        rag_strategy=rag_strategy,
         ranked=len(ranked_chunks),
         confidence=round(confidence, 4),
         is_high_confidence=is_high_confidence,
@@ -549,7 +506,7 @@ async def generate_rag_node(state: QAState) -> dict:
     ranked_chunks = state.get("ranked_chunks", [])
     query         = state["original_query"]
     messages      = state.get("messages", [])
-    summary       = state.get("existing_summary")
+    summary       = state.get("summary")
 
     # 构建知识库上下文与来源列表
     context_parts = []
@@ -653,7 +610,7 @@ async def generate_direct_node(state: QAState) -> dict:
     """
     query    = state["original_query"]
     messages = state.get("messages", [])
-    summary  = state.get("existing_summary")
+    summary  = state.get("summary")
 
     llm_messages = [SystemMessage(content=_build_system_content(summary))]
 
@@ -722,7 +679,7 @@ async def generate_direct_node(state: QAState) -> dict:
 
 async def generate_general_node(state: QAState) -> dict:
     """
-    通用问题直答节点（query_type=GENERAL）。
+    通用问题直答节点（intent=GENERAL）。
 
     适用于：打招呼、问时间、闲聊等与课程无关的问题。
     联网模式下若 web_search_results 非空，注入搜索结果提供时效性信息。
@@ -822,63 +779,29 @@ async def enqueue_pending_node(state: QAState) -> dict:
 # 节点：save_memory — 记忆保存（纯副作用）
 # ──────────────────────────────────────────────────────────────
 
-async def save_memory_node(state: QAState) -> dict:
+async def save_memory_node(state: QAState, runtime: Runtime[QAContext]) -> dict:
     """
-    记忆保存节点：条件触发摘要压缩 + 写回 qa_sessions 表。
+    记忆保存节点：条件触发摘要压缩。
 
-    should_summarize=True（对话超过 10 轮）时先压缩历史再写库。
-    两步均失败静默，不中断流程。返回 {} 不修改 State。
+    should_summarize=True（对话超过 10 轮）时压缩历史。
+    checkpointer 自动持久化 state，无需手动写 DB。
+    任何步骤失败静默，不中断流程。
     """
-    from backend.dependencies import AsyncSessionLocal
+    messages = state.get("messages", [])
+    summary  = state.get("summary")
 
-    messages   = state.get("messages", [])
-    student_id = state["student_id"]
-    session_id = state["session_id"]
-    tenant_id  = state["tenant_id"]
-    thread_id  = build_thread_id(student_id, session_id)
-    summary    = state.get("existing_summary")
-
-    # ── 条件触发摘要压缩 ─────────────────────────────────────────
     if state.get("should_summarize", False):
         try:
-            # 只压缩最近 10 轮（≤20 条消息），旧知识由 existing_summary 保留。
-            # 若直接传全量 messages，随对话增长输入会线性膨胀，
-            # 最终超出 DeepSeek-V3 的 64k context 上限。
             msgs_to_compress = trim_messages_to_window(messages, window_size=10)
             summary = await compress_to_summary(
                 messages=msgs_to_compress,
                 existing_summary=summary,
             )
-            logger.info("save_memory.summary_compressed", thread_id=thread_id)
+            logger.info("save_memory.summary_compressed")
         except Exception as e:
             logger.warning("save_memory.compress_failed", error=str(e))
 
-        # ── UPSERT 到 qa_sessions 表 ──────────────────────────────────
-        try:
-            async with AsyncSessionLocal() as session:
-                async with session.begin():
-                    await session.execute(
-                        text("""
-                            INSERT INTO qa_sessions
-                                (id, tenant_id, student_id, thread_id, summary, summary_version)
-                            VALUES (:id, :tenant_id, :student_id, :thread_id, :summary, 1)
-                            ON CONFLICT (thread_id) DO UPDATE
-                                SET summary         = EXCLUDED.summary,
-                                    summary_version = qa_sessions.summary_version + 1,
-                                    updated_at      = NOW()
-                        """),
-                        {
-                            "id":         str(uuid.uuid4()),
-                            "tenant_id":  tenant_id,
-                            "student_id": student_id,
-                            "thread_id":  thread_id,
-                            "summary":    summary,
-                        },
-                    )
-        except Exception as e:
-            logger.warning("save_memory.db_write_failed", error=str(e))
-
-    return {}
+    return {"summary": summary} if summary else {}
 
 
 if __name__ == "__main__":

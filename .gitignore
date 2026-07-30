@@ -21,3 +21,4 @@ backend/agents/qa/parse_demo.py
 .env
 .env.local
 .DS_Store
+my_resume/

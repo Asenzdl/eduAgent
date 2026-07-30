@@ -1,68 +1,54 @@
 from pathlib import Path
-from langgraph.checkpoint.memory import MemorySaver
+
+from psycopg_pool import AsyncConnectionPool
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage, ToolMessage
 from backend.core.logger import get_logger
-from backend.utils.utils import slice_last_n_rounds
+from backend.config import get_settings
 
 logger = get_logger(__name__)
 
-# 每个 Agent 独立的 MemorySaver 实例
-# 不同 Agent 的 State schema 不同，共用同一个 MemorySaver 会导致
-# msgpack 序列化时 schema 字段冲突，必须隔离
-_memory_savers: dict[str, MemorySaver] = {}
+
+# ── LangGraph Checkpointer ──────────────────────────────────────
+# 模块级全局变量，lifespan startup 时初始化，shutdown 时关闭。
+# 调用方直接 import checkpointer 使用，无需 getter 函数。
+
+checkpointer: AsyncPostgresSaver | None = None
 
 
-def get_memory_saver(agent_type: str = "default") -> MemorySaver:
+async def init_checkpointer() -> None:
+    """应用启动时初始化 AsyncPostgresSaver + psycopg 连接池。
+
+    · 创建全局连接池（min=1, max=5）
+    · 幂等建表（checkpoints / checkpoint_blobs / checkpoint_writes）
+    · 只应由 FastAPI lifespan 调用一次
     """
-    获取指定 Agent 类型的 MemorySaver 单例。
+    global checkpointer
+    if checkpointer is not None:
+        return
 
-    本地阶段使用内存存储（进程重启后历史丢失）。
-    生产阶段替换为 AsyncPostgresSaver 即可持久化，业务代码无需修改。
-
-    Args:
-        agent_type: Agent 标识符，如 "qa" / "exam" / "resume" / "interview"
-
-    Returns:
-        MemorySaver 实例，传给 StateGraph.compile(checkpointer=...)
-    """
-    if agent_type not in _memory_savers:
-        _memory_savers[agent_type] = MemorySaver()
-        logger.info("memory.saver_initialized", agent=agent_type)
-    return _memory_savers[agent_type]
-
-
-def build_thread_id(student_id: str, session_id: str) -> str:
-    """
-    构建 LangGraph Checkpointer 使用的 thread_id。
-
-    格式：student_{student_id}_session_{session_id}
-    同一学员的不同会话有独立的历史，互不干扰。
-
-    Example:
-        build_thread_id("abc123", "xyz789")
-        → "student_abc123:session_xyz789"
-    """
-    return f"student_{student_id}:session_{session_id}"
+    settings = get_settings()
+    pool = AsyncConnectionPool(
+        conninfo=settings.checkpointer_database_url,
+        min_size=1,
+        max_size=5,
+        open=True,
+    )
+    checkpointer = AsyncPostgresSaver(pool)
+    await checkpointer.setup()
+    logger.info("memory.checkpointer_initialized", min=1, max=5)
 
 
-def build_config(student_id: str, session_id: str) -> dict:
-    """
-    构建 LangGraph 调用所需的 config 字典。
+async def close_checkpointer() -> None:
+    """应用关闭时释放 psycopg 连接池。"""
+    global checkpointer
+    if checkpointer is not None and isinstance(checkpointer.conn, AsyncConnectionPool):
+        await checkpointer.conn.close()
+        checkpointer = None
+        logger.info("memory.checkpointer_closed")
 
-    用法：
-        config = build_config(student_id, session_id)
-        result = await graph.ainvoke(state, config=config)
 
-    Returns:
-        {"configurable": {"thread_id": "student_xxx_session_yyy"}}
-    """
-    return {
-        "configurable": {
-            "thread_id": build_thread_id(student_id, session_id),
-        }
-    }
-    
-# 大 ToolMessage 内容归档目录
+# ── 大 ToolMessage 内容归档目录 ──────────────────────────────────
 _ARCHIVE_DIR = Path("data/tool_archives")
 
 
